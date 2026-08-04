@@ -32,6 +32,7 @@ setup(
             'frontier_explorer = autonomous_nav.frontier_explorer:main',
             'waypoint_manager = autonomous_nav.waypoint_manager:main',
             'orb_slam_bridge = autonomous_nav.orb_slam_bridge:main',
+            'exploration_metrics = autonomous_nav.metrics:main',
         ],
     },
 )
