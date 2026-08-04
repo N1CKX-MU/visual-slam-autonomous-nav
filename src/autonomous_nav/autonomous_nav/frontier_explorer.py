@@ -1,0 +1,345 @@
+#!/usr/bin/env python3
+"""Frontier-based autonomous exploration.
+
+Detects boundaries between known free space and unknown space in the
+occupancy grid, clusters them, and navigates to the best frontier
+until the entire environment is mapped.
+"""
+import rclpy
+from rclpy.node import Node
+from rclpy.action import ActionClient
+from nav_msgs.msg import OccupancyGrid
+from nav2_msgs.action import NavigateToPose
+from geometry_msgs.msg import PoseStamped
+from visualization_msgs.msg import Marker, MarkerArray
+import numpy as np
+from scipy import ndimage
+import math
+import tf2_ros
+
+
+class FrontierExplorer(Node):
+    def __init__(self):
+        super().__init__('frontier_explorer')
+
+        # Parameters
+        self.declare_parameter('min_frontier_size', 5)
+        self.declare_parameter('exploration_timeout', 30.0)
+        self.declare_parameter('blacklist_radius', 0.5)
+        self.declare_parameter('recheck_interval', 5.0)
+
+        self._min_frontier_size = (
+            self.get_parameter('min_frontier_size')
+            .get_parameter_value().integer_value
+        )
+        self._exploration_timeout = (
+            self.get_parameter('exploration_timeout')
+            .get_parameter_value().double_value
+        )
+        self._blacklist_radius = (
+            self.get_parameter('blacklist_radius')
+            .get_parameter_value().double_value
+        )
+        recheck_interval = (
+            self.get_parameter('recheck_interval')
+            .get_parameter_value().double_value
+        )
+
+        # State
+        self.current_map = None
+        self.is_navigating = False
+        self.current_target = None
+        self.blacklisted_frontiers = []
+        self.consecutive_failures = 0
+        self._total_goals_sent = 0
+        self._total_goals_reached = 0
+
+        # TF buffer for robot pose
+        self._tf_buffer = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+
+        # Subscribe to SLAM map
+        self.create_subscription(
+            OccupancyGrid, '/map', self.map_callback, 10
+        )
+
+        # Nav2 action client
+        self._nav_client = ActionClient(
+            self, NavigateToPose, 'navigate_to_pose'
+        )
+
+        # Frontier visualization
+        self._frontier_pub = self.create_publisher(
+            MarkerArray, 'frontier_markers', 10
+        )
+
+        # Exploration loop timer
+        self.create_timer(recheck_interval, self.explore_step)
+
+        self.get_logger().info('Frontier explorer initialized')
+
+    def map_callback(self, msg: OccupancyGrid):
+        self.current_map = msg
+
+    def _get_robot_pose(self):
+        """Get robot position in map frame via TF."""
+        try:
+            t = self._tf_buffer.lookup_transform(
+                'map', 'base_link', rclpy.time.Time()
+            )
+            return (
+                t.transform.translation.x,
+                t.transform.translation.y,
+            )
+        except (tf2_ros.LookupException,
+                tf2_ros.ConnectivityException,
+                tf2_ros.ExtrapolationException):
+            return None
+
+    def explore_step(self):
+        """One iteration of the exploration loop."""
+        if self.current_map is None:
+            self.get_logger().info('Waiting for map...', throttle_duration_sec=10.0)
+            return
+
+        if self.is_navigating:
+            return
+
+        if self.consecutive_failures > 5:
+            self.get_logger().warn(
+                'Too many consecutive failures — clearing blacklist'
+            )
+            self.blacklisted_frontiers.clear()
+            self.consecutive_failures = 0
+
+        frontiers = self._detect_frontiers()
+        self._publish_frontier_markers(frontiers)
+
+        if len(frontiers) == 0:
+            self._log_completion()
+            return
+
+        robot_pose = self._get_robot_pose()
+        target = self._select_frontier(frontiers, robot_pose)
+
+        if target is not None:
+            self._navigate_to(target)
+
+    def _detect_frontiers(self):
+        """Find and cluster frontier cells in the occupancy grid."""
+        grid = np.array(self.current_map.data).reshape(
+            self.current_map.info.height,
+            self.current_map.info.width,
+        )
+
+        free_mask = (grid == 0)
+        unknown_mask = (grid == -1)
+
+        # Find free cells that are adjacent to unknown cells
+        kernel = np.ones((3, 3), dtype=bool)
+        free_dilated = ndimage.binary_dilation(free_mask, structure=kernel)
+        frontier_mask = free_dilated & unknown_mask
+
+        frontier_coords = np.argwhere(frontier_mask)
+        if len(frontier_coords) == 0:
+            return []
+
+        return self._cluster_frontiers(frontier_coords)
+
+    def _cluster_frontiers(self, coords):
+        """Group frontier cells into connected clusters."""
+        grid = np.zeros(
+            (self.current_map.info.height, self.current_map.info.width),
+            dtype=bool,
+        )
+        grid[coords[:, 0], coords[:, 1]] = True
+        labeled, n_clusters = ndimage.label(grid)
+
+        info = self.current_map.info
+        clusters = []
+
+        for i in range(1, n_clusters + 1):
+            cluster_cells = np.argwhere(labeled == i)
+            if len(cluster_cells) < self._min_frontier_size:
+                continue
+
+            centroid = cluster_cells.mean(axis=0)
+            # Convert grid coords (row, col) to world coords (x, y)
+            wx = info.origin.position.x + centroid[1] * info.resolution
+            wy = info.origin.position.y + centroid[0] * info.resolution
+
+            # Skip blacklisted locations
+            if self._is_blacklisted(wx, wy):
+                continue
+
+            clusters.append({
+                'x': wx,
+                'y': wy,
+                'size': len(cluster_cells),
+            })
+
+        return clusters
+
+    def _is_blacklisted(self, x, y):
+        """Check if a frontier is near a previously blacklisted location."""
+        for bx, by in self.blacklisted_frontiers:
+            dist = math.sqrt((x - bx) ** 2 + (y - by) ** 2)
+            if dist < self._blacklist_radius:
+                return True
+        return False
+
+    def _select_frontier(self, clusters, robot_pose):
+        """Pick the best frontier balancing size and proximity."""
+        if not clusters:
+            return None
+
+        best = None
+        best_score = -float('inf')
+
+        for c in clusters:
+            # Score: balance between cluster size and distance to robot
+            size_score = c['size']
+
+            if robot_pose is not None:
+                dist = math.sqrt(
+                    (c['x'] - robot_pose[0]) ** 2
+                    + (c['y'] - robot_pose[1]) ** 2
+                )
+                # Avoid very close frontiers (likely noise)
+                if dist < 0.3:
+                    continue
+                # Prefer closer, larger frontiers
+                score = size_score / (dist + 1.0)
+            else:
+                score = size_score
+
+            if score > best_score:
+                best_score = score
+                best = (c['x'], c['y'])
+
+        return best
+
+    def _navigate_to(self, target):
+        """Send a navigation goal to Nav2."""
+        self.is_navigating = True
+        self.current_target = target
+        self._total_goals_sent += 1
+
+        goal = NavigateToPose.Goal()
+        goal.pose.header.frame_id = 'map'
+        goal.pose.header.stamp = self.get_clock().now().to_msg()
+        goal.pose.pose.position.x = target[0]
+        goal.pose.pose.position.y = target[1]
+        goal.pose.pose.orientation.w = 1.0
+
+        self.get_logger().info(
+            f'[{self._total_goals_sent}] Navigating to frontier '
+            f'({target[0]:.2f}, {target[1]:.2f})'
+        )
+
+        if not self._nav_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error('Nav2 action server not available')
+            self.is_navigating = False
+            return
+
+        future = self._nav_client.send_goal_async(goal)
+        future.add_done_callback(self._goal_response_cb)
+
+    def _goal_response_cb(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().warn('Goal rejected by Nav2')
+            self.is_navigating = False
+            self.consecutive_failures += 1
+            return
+
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self._nav_complete_cb)
+
+    def _nav_complete_cb(self, future):
+        result = future.result()
+        status = result.status
+
+        if status == 4:  # ABORTED
+            self.get_logger().warn(
+                f'Goal aborted — blacklisting '
+                f'({self.current_target[0]:.2f}, {self.current_target[1]:.2f})'
+            )
+            self.blacklisted_frontiers.append(self.current_target)
+            self.consecutive_failures += 1
+        elif status == 6:  # CANCELED
+            self.get_logger().warn('Navigation canceled')
+            self.consecutive_failures += 1
+        else:
+            self.get_logger().info('Reached frontier, scanning for next...')
+            self._total_goals_reached += 1
+            self.consecutive_failures = 0
+
+        self.is_navigating = False
+
+    def _log_completion(self):
+        """Log exploration statistics."""
+        grid = np.array(self.current_map.data)
+        free = np.sum(grid == 0)
+        unknown = np.sum(grid == -1)
+        occupied = np.sum(grid > 0)
+        total_known = free + occupied
+
+        completeness = (
+            total_known / (total_known + unknown) * 100
+            if (total_known + unknown) > 0
+            else 0
+        )
+
+        self.get_logger().info(
+            f'No frontiers remaining — exploration complete!\n'
+            f'  Map completeness: {completeness:.1f}%\n'
+            f'  Goals sent: {self._total_goals_sent}\n'
+            f'  Goals reached: {self._total_goals_reached}\n'
+            f'  Blacklisted: {len(self.blacklisted_frontiers)}'
+        )
+
+    def _publish_frontier_markers(self, clusters):
+        """Publish frontier cluster centroids as RViz markers."""
+        marker_array = MarkerArray()
+
+        # Clear old markers
+        clear_marker = Marker()
+        clear_marker.action = Marker.DELETEALL
+        marker_array.markers.append(clear_marker)
+
+        for i, c in enumerate(clusters):
+            marker = Marker()
+            marker.header.frame_id = 'map'
+            marker.header.stamp = self.get_clock().now().to_msg()
+            marker.ns = 'frontiers'
+            marker.id = i
+            marker.type = Marker.CYLINDER
+            marker.action = Marker.ADD
+            marker.pose.position.x = c['x']
+            marker.pose.position.y = c['y']
+            marker.pose.position.z = 0.1
+            marker.pose.orientation.w = 1.0
+            marker.scale.x = 0.3
+            marker.scale.y = 0.3
+            marker.scale.z = 0.2
+
+            # Color by size: larger clusters are greener
+            marker.color.r = 0.2
+            marker.color.g = min(1.0, c['size'] / 50.0)
+            marker.color.b = 0.8
+            marker.color.a = 0.7
+            marker_array.markers.append(marker)
+
+        self._frontier_pub.publish(marker_array)
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = FrontierExplorer()
+    rclpy.spin(node)
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
